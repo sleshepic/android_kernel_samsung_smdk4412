@@ -1,11 +1,15 @@
 /*
- * Author: andip71, 10.01.2013
+ * Author: andip71, 14.01.2014
+ * 
+ * Modifications: Yank555.lu 20.08.2013
  *
- * Version 1.4.3
+ * Version 1.6.5
  *
  * credits: Supercurio for ideas and partially code from his Voodoo
- * 	    sound implementation,
+ * 	    	sound implementation,
+ *          Yank555 for great support on problem analysis and new ideas,
  *          Gokhanmoral for further modifications to the original code
+ * 			AndreiLux for his modified detection routines
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -15,6 +19,14 @@
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
+ *
+ */
+
+/*
+ * Change log:
+ *
+ * 1.6.5 (14.01.2014)
+ *   - Allow speaker level minimum of 20
  *
  */
 
@@ -32,6 +44,13 @@
 
 #include "boeffla_sound.h"
 
+// Use delayed work to re-apply eq on headphone changes
+#include <linux/jiffies.h>
+#include <linux/workqueue.h>
+
+struct delayed_work apply_settings_work;
+bool apply_settings_work_scheduled = false;
+int change_delay = DEFAULT_CHANGE_DELAY;
 
 /*****************************************/
 // Static variables
@@ -42,34 +61,46 @@ static struct snd_soc_codec *codec;
 static struct wm8994_priv *wm8994;
 
 // internal boeffla sound variables
-static int boeffla_sound;
-static int debug_level;
+static int boeffla_sound;		// boeffla sound master switch
+static int debug_level;			// debug level for logging into kernel log
 
-static int headphone_l, headphone_r;
+static int headphone_l, headphone_r;	// headphone volume left/right
 
-static int speaker_l, speaker_r;
+static int speaker_l, speaker_r;		// speaker volume left/right
 
-static int eq;
+static int speaker_tuning;  	// activates speaker eq
 
-static int eq_gains[5];
+static int eq;   				// activates headphone eq
 
-static unsigned int eq_bands[5][4];
+static int eq_gains[5];			// gain information for headphone eq (speaker is static)
 
-static int dac_direct;
-static int dac_oversampling;
-static int fll_tuning;
-static int privacy_mode;
+static unsigned int eq_bands[5][4];	// frequency setup for headphone eq (speaker is static)
 
-static int mic_mode;
+static int dac_direct;			// activate dac_direct for headphone eq
+static int dac_oversampling;	// activate 128bit oversampling for headphone eq
+static int fll_tuning;			// activate fll tuning to avoid jitter
+static int stereo_expansion_gain;	// activate stereo expansion effect if greater than zero
+static int mono_downmix;		// activate mono downmix
+static int privacy_mode;		// activate privacy mode
 
-static unsigned int debug_register;
+static int mic_level_general;	// microphone sensivity for general recording purposes
+static int mic_level_call;		// microphone sensivity for call only
+
+static unsigned int debug_register;		// current register to show in debug register interface
 
 // internal state variables
-static bool is_call;
-static bool is_headphone;
-static bool is_socket;
-static bool is_fmradio;
-static bool is_eq;
+static bool is_call;			// is currently a call active?
+static bool is_headphone;		// is headphone connected?
+static bool is_fmradio;			// is stock fm radio app active?
+static bool is_eq;				// is an equalizer (headphone or speaker tuning) active?
+static bool is_eq_headphone;	// is equalizer for headphone or speaker currently?
+static bool is_mic_controlled;	// is microphone sensivity controlled by boeffla-sound or not?
+static bool is_mono_downmix;	// is mono downmix active?
+
+static int regdump_bank;		// current bank configured for register dump
+static unsigned int regcache[REGDUMP_BANKS * REGDUMP_REGISTERS + 1];	// register cache to highlight changes in dump
+
+static int mic_level;			// internal mic level
 
 
 /*****************************************/
@@ -80,11 +111,9 @@ static unsigned int wm8994_read(struct snd_soc_codec *codec, unsigned int reg);
 static int wm8994_write(struct snd_soc_codec *codec, unsigned int reg, unsigned int value);
 
 static bool debug(int level);
-static bool check_for_call(unsigned int val);
-static bool check_for_socket(unsigned int val);
+static bool check_for_call(void);
 static bool check_for_headphone(void);
 static bool check_for_fmradio(void);
-static void handler_headphone_detection(void);
 
 static void set_headphone(void);
 static unsigned int get_headphone_l(unsigned int val);
@@ -96,9 +125,10 @@ static unsigned int get_speaker_r(unsigned int val);
 
 static void set_eq(void);
 static void set_eq_gains(void);
-static void set_eq_bands(int band);
+static void set_eq_bands(void);
 static void set_eq_satprevention(void);
 static unsigned int get_eq_satprevention(int reg_index, unsigned int val);
+static void set_speaker_boost(void);
 
 static void set_dac_direct(void);
 static unsigned int get_dac_direct_l(unsigned int val);
@@ -106,10 +136,14 @@ static unsigned int get_dac_direct_r(unsigned int val);
 
 static void set_dac_oversampling(void);
 static void set_fll_tuning(void);
+static void set_stereo_expansion(void);
+static void set_mono_downmix(void);
+static unsigned int get_mono_downmix(unsigned int val);
 
-static void set_mic_mode(void);
-static unsigned int get_mic_mode(int reg_index);
-static unsigned int get_mic_mode_for_hook(int reg_index, unsigned int value);
+static void set_mic_level(void);
+static unsigned int get_mic_level(int reg_index, unsigned int val);
+
+static void reset_boeffla_sound(void);
 
 
 /*****************************************/
@@ -128,68 +162,45 @@ void Boeffla_sound_hook_wm8994_pcm_probe(struct snd_soc_codec *codec_pointer)
 
 	// Print debug info
 	printk("Boeffla-sound: codec pointer received\n");
+
+	// Initialize boeffla sound master switch finally
+	boeffla_sound = BOEFFLA_SOUND_DEFAULT;
+
+	// If boeffla sound is enabled during driver start, reset to default configuration
+	if (boeffla_sound == ON)
+	{
+		reset_boeffla_sound();
+		printk("Boeffla-sound: boeffla sound enabled during startup\n");
+	}
 }
 
 
 unsigned int Boeffla_sound_hook_wm8994_write(unsigned int reg, unsigned int val)
 {
 	unsigned int newval;
+	bool change_regs = false;
+
+	bool current_is_call;
+	bool current_is_headphone;
+	bool current_is_fmradio;
 
 	// Terminate instantly if boeffla sound is not enabled and return
 	// original value back
 	if (!boeffla_sound)
 		return val;
 
+	// Detect current output for call, headphone and fm radio
+	current_is_call	= check_for_call();
+	current_is_headphone = check_for_headphone();
+	current_is_fmradio = check_for_fmradio();
+
 	// If the write request of the original driver is for specific registers,
 	// change value to boeffla sound values accordingly as new return value
 	newval = val;
 
+	// based on the register, do the appropriate processing
 	switch (reg)
 	{
-
-		// call detection
-		case WM8994_AIF2_CONTROL_2:
-		{
-			if (is_call != check_for_call(val))
-			{
-				is_call = !is_call;
-
-				if (debug(DEBUG_NORMAL))
-					printk("Boeffla-sound: Call detection new status %d\n", is_call);
-
-				// switch equalizer and mic mode
-				set_eq();
-				set_mic_mode();
-			}
-
-			break;
-		}
-
-		// socket connection/disconnection detection (incl. headphone un-plug)
-		// (see headphone detection below for plug-in)
-		case WM1811_JACKDET_CTRL:
-		{
-			if (check_for_socket(val))
-			{
-				is_socket = true;
-
-				if (debug(DEBUG_NORMAL))
-					printk("Boeffla-sound: Socket plugged-in\n");
-			}
-			else
-			{
-				is_socket = false;
-				is_headphone = false;
-
-				if (debug(DEBUG_NORMAL))
-					printk("Boeffla-sound: Socket un-plugged\n");
-
-				// Handler: switch equalizer and set speaker volume (for privacy mode)
-				set_eq();
-				set_speaker();
-			}
-			break;
-		}
 
 		// left headphone volume
 		case WM8994_LEFT_OUTPUT_VOLUME:
@@ -219,6 +230,8 @@ unsigned int Boeffla_sound_hook_wm8994_write(unsigned int reg, unsigned int val)
 			break;
 		}
 
+// Do not touch dac direct at all when P4NOTE
+#ifndef CONFIG_MACH_P4NOTE
 		// dac_direct left channel
 		case WM8994_OUTPUT_MIXER_1:
 		{
@@ -230,6 +243,14 @@ unsigned int Boeffla_sound_hook_wm8994_write(unsigned int reg, unsigned int val)
 		case WM8994_OUTPUT_MIXER_2:
 		{
 			newval = get_dac_direct_r(val);
+			break;
+		}
+#endif
+
+		// mono downmix
+		case WM8994_AIF1_DAC1_FILTERS_1:
+		{
+			newval = get_mono_downmix(val);
 			break;
 		}
 
@@ -254,90 +275,81 @@ unsigned int Boeffla_sound_hook_wm8994_write(unsigned int reg, unsigned int val)
 			break;
 		}
 
-		// Microphone: left input volume
+		// EQ saturation prevention: dynamic range control 1_4
+		case WM8994_AIF1_DRC1_4:
+		{
+			newval = get_eq_satprevention(4, val);
+			break;
+		}
+
+		// Microphone: left input level
 		case WM8994_LEFT_LINE_INPUT_1_2_VOLUME:
 		{
-			newval = get_mic_mode_for_hook(1, val);
+			newval = get_mic_level(1, val);
 			break;
 		}
 
-
-		// Microphone: right input volume
+		// Microphone: right input level
 		case WM8994_RIGHT_LINE_INPUT_1_2_VOLUME:
 		{
-			newval = get_mic_mode_for_hook(2, val);
+			newval = get_mic_level(2, val);
 			break;
 		}
 
-		// Microphone: input mixer 3 = left channel
-		case WM8994_INPUT_MIXER_3:
-		{
-			newval = get_mic_mode_for_hook(3, val);
-			break;
-		}
-
-		// Microphone: input mixer 4 = right channel
-		case WM8994_INPUT_MIXER_4:
-		{
-			newval = get_mic_mode_for_hook(4, val);
-			break;
-		}
-
-		// Microphone: dynamic range control 2_1
-		case WM8994_AIF1_DRC2_1:
-		{
-			newval = get_mic_mode_for_hook(5, val);
-			break;
-		}
-
-		// Microphone: dynamic range control 2_2
-		case WM8994_AIF1_DRC2_2:
-		{
-			newval = get_mic_mode_for_hook(6, val);
-			break;
-		}
-
-		// Microphone: dynamic range control 2_3
-		case WM8994_AIF1_DRC2_3:
-		{
-			newval = get_mic_mode_for_hook(7, val);
-			break;
-		}
-
-		// Microphone: dynamic range control 2_4
-		case WM8994_AIF1_DRC2_4:
-		{
-			newval = get_mic_mode_for_hook(8, val);
-			break;
-		}
 	}
 
-	// Headphone plug-in detection
-	// ( for un-plug detection see above, this is covered by checking a register)
-	if (is_socket && !is_headphone)
+	// Headphone detection
+	if (is_headphone != current_is_headphone)
 	{
-		handler_headphone_detection();
+		is_headphone = current_is_headphone;
+
+		if (debug(DEBUG_NORMAL))
+			printk("Boeffla-sound: Output new status - %s\n", is_headphone ? "Headphone" : "Speaker");
+
+		// Registers have to be updated
+		change_regs = true;
+	}
+
+	// call detection
+	if (is_call != current_is_call)
+	{
+		is_call = current_is_call;
+
+		if (debug(DEBUG_NORMAL))
+			printk("Boeffla-sound: Call detection new status - %s\n", is_call ? "in call" : "not in call");
+
+		// Registers have to be updated
+		change_regs = true;
 	}
 
 	// FM radio detection
-	// Important note: We need to absolutely make sure we do not do this detection if one of the 
-	// two output mixers are called in this hook (as they can potentially be modified again in the
-	// set_dac_direct call). Otherwise this adds strange value overwriting effects.
-	if (is_fmradio != check_for_fmradio() &&
-		(reg != WM8994_OUTPUT_MIXER_1) && (reg != WM8994_OUTPUT_MIXER_2))
+	if (is_fmradio != current_is_fmradio)
 	{
-		is_fmradio = !is_fmradio;
+		is_fmradio = current_is_fmradio;
 
 		if (debug(DEBUG_NORMAL))
-			printk("Boeffla-sound: FM radio detection new status %d\n", is_fmradio);
+			printk("Boeffla-sound: FM radio detection new status - %s\n", is_fmradio ? "active" : "inactive");
 
-		// Switch dac_direct
-		set_dac_direct();
+		// Registers have to be updated
+		change_regs = true;
+	}
+
+	// Update sound environment due to change detection
+	if (change_regs || is_headphone)
+	{
+		// New changes while work is still pending, cancel before rescheduling,
+		// best is to set everything once all calls are through
+		if (apply_settings_work_scheduled)
+			cancel_delayed_work_sync(&apply_settings_work);
+
+		// schedule to apply new settings in change_delay time
+		schedule_delayed_work(&apply_settings_work, usecs_to_jiffies(change_delay));
+		apply_settings_work_scheduled = true;
 	}
 
 	// print debug info
 	if (debug(DEBUG_VERBOSE))
-		printk("Boeffla-sound: write hook %d -> %d (Orig:%d), c:%d, h:%d, r:%d\n", 
+		printk("Boeffla-sound: write hook %d -> %d (Orig:%d), c:%d, h:%d, r:%d\n",
 				reg, newval, val, is_call, is_headphone, is_fmradio);
 
 	return newval;
@@ -475,32 +487,46 @@ static unsigned int wm8994_read(struct snd_soc_codec *codec,
 // Internal helper functions
 /*****************************************/
 
-static bool check_for_call(unsigned int val)
+bool check_for_dapm(enum snd_soc_dapm_type dapm_type, char* widget_name)
 {
-	// check via register WM8994_AIF2DACR if currently call active
-	if (!(val & WM8994_AIF2DACR_SRC_MASK))
-		return true;
+	struct snd_soc_dapm_widget *w;
+
+	/* Iterate widget list and find power mode of given widget per its name */
+	list_for_each_entry(w, &codec->card->widgets, list) 
+	{
+		if (w->dapm != &codec->dapm)
+			continue;
+
+		/* DAPM types in include/sound/soc-dapm.h */
+		if (w->id == dapm_type && !strcmp(w->name, widget_name))
+			return w->power;
+	}
 
 	return false;
 }
 
 
-static bool check_for_socket(unsigned int val)
+bool check_for_fmradio(void)
 {
-	// check via register WM1811_JACKDET if something is plugged in currently
-	if (val & WM1811_JACKDET_DB_MASK)
-		return false;
-
-	return true;
+// if no fm radio built in, always set to false
+#ifdef CONFIG_FM_RADIO
+	return check_for_dapm(snd_soc_dapm_line, "FM In");
+#else
+	return false;
+#endif
 }
 
 
-static bool check_for_headphone(void)
+bool check_for_call(void)
 {
-	// check status of micdet zero jacket to find out whether headphone
-	// or headset is currently connected
-	// Note: This always shows status delayed after something has been plugged in or
-	// unplugged !!!
+	return check_for_dapm(snd_soc_dapm_spk, "RCV");
+}
+
+
+bool check_for_headphone(void)
+{
+// different headphone detection for s3 devices and note devices
+#ifndef CONFIG_MACH_P4NOTE
 	if( wm8994->micdet[0].jack != NULL )
 	{
 		if ((wm8994->micdet[0].jack->status & SND_JACK_HEADPHONE) ||
@@ -509,68 +535,9 @@ static bool check_for_headphone(void)
 	}
 
 	return false;
-}
-
-
-static bool check_for_fmradio(void)
-{
-	struct snd_soc_dapm_widget *w;
-
-	// loop through widget list to find widget for FM radio and check
-	// power state of it
-	list_for_each_entry(w, &codec->card->widgets, list)
-	{
-		if (w->dapm != &codec->dapm)
-			continue;
-
-		switch (w->id) 
-		{
-			case snd_soc_dapm_line:
-				if (w->name)
-				{
-					if(strstr(w->name,"FM In") != 0)
-					{
-						if((w->power) != 0)
-							return true;
-						else
-							return false;
-					}
-				}
-				break;
-			case snd_soc_dapm_mic:
-			case snd_soc_dapm_hp:
-			case snd_soc_dapm_spk:
-			case snd_soc_dapm_micbias:
-			case snd_soc_dapm_dac:
-			case snd_soc_dapm_adc:
-			case snd_soc_dapm_pga:
-			case snd_soc_dapm_out_drv:
-			case snd_soc_dapm_mixer:
-			case snd_soc_dapm_mixer_named_ctl:
-			case snd_soc_dapm_supply:
-				break;
-			default:
-				break;
-		}
-	}
-
-	return false;
-}
-
-
-static void handler_headphone_detection(void)
-{
-	if (check_for_headphone())
-	{
-		is_headphone = true;
-
-		if (debug(DEBUG_NORMAL))
-			printk("Boeffla-sound: Headphone or headset found\n");
-
-		// Handler: switch equalizer and set speaker volume (for privacy mode)
-		set_eq();
-		set_speaker();
-	}
+#else
+	return check_for_dapm(snd_soc_dapm_hp, "HP");
+#endif
 }
 
 
@@ -583,7 +550,6 @@ static bool debug (int level)
 
 	return false;
 }
-
 
 
 /*****************************************/
@@ -627,7 +593,6 @@ static unsigned int get_headphone_r(unsigned int val)
 
 
 // Speaker volume
-
 static void set_speaker(void)
 {
 	unsigned int val;
@@ -644,21 +609,19 @@ static void set_speaker(void)
 	// print debug info
 	if (debug(DEBUG_NORMAL))
 	{
-	if((privacy_mode == ON) && is_headphone)
-			printk("Boeffla-sound: set_speaker to mute (privacy mode)\n");
+		if((privacy_mode == ON) && is_headphone)
+				printk("Boeffla-sound: set_speaker to mute (privacy mode)\n");
 		else
-			printk("Boeffla-sound: set_speaker %d %d\n", speaker_l, speaker_r);
+				printk("Boeffla-sound: set_speaker %d %d\n", speaker_l, speaker_r);
 	}
 }
-
 
 static unsigned int get_speaker_l(unsigned int val)
 {
 	// if privacy mode is on, we set value to zero, otherwise to configured speaker volume
 	if((privacy_mode == ON) && is_headphone)
-	{
 		return (val & ~WM8994_SPKOUTL_VOL_MASK);
-	}
+
 	return (val & ~WM8994_SPKOUTL_VOL_MASK) | speaker_l;
 }
 
@@ -667,9 +630,8 @@ static unsigned int get_speaker_r(unsigned int val)
 {
 	// if privacy mode is on, we set value to zero, otherwise to configured speaker volume
 	if((privacy_mode == ON) && is_headphone)
-	{
 		return (val & ~WM8994_SPKOUTR_VOL_MASK);
-	}
+
 	return (val & ~WM8994_SPKOUTR_VOL_MASK) | speaker_r;
 }
 
@@ -680,130 +642,231 @@ static void set_eq(void)
 {
 	unsigned int val;
 
-	// read current register value from audio hub
-	val = wm8994_read(codec, WM8994_AIF1_DAC1_EQ_GAINS_1);
+	// Equalizer will only be switched on in fact if
+	// 1. headphone eq is on, there is no call and there is headphone connected -- or --
+	// 2. speaker tuning is enabled, there is no call and there is no headphone connected
 
-	// Equalizer will only be switched on in fact if there is no call and if there is
-	// a headphone connected
-	if (is_call || !is_headphone || eq == EQ_OFF)
+	// set internal state variables
+	if (!is_call && is_headphone && eq != EQ_OFF)
 	{
-		// switch EQ off + print debug
-		val &= ~WM8994_AIF1DAC1_EQ_ENA_MASK;
-		is_eq = OFF;
-
-		if (debug(DEBUG_NORMAL))
-			printk("Boeffla-sound: set_eq off\n");
+		is_eq = true;
+		is_eq_headphone = true;
+	}
+	else if (!is_call && !is_headphone && speaker_tuning == ON)
+	{
+		is_eq = true;
+		is_eq_headphone = false;
 	}
 	else
 	{
+		is_eq = false;
+		is_eq_headphone = false;
+	}
+
+	// switch equalizer based on internal status
+	if (is_eq)
+	{
 		// switch EQ on + print debug
+		val = wm8994_read(codec, WM8994_AIF1_DAC1_EQ_GAINS_1);
 		val |= WM8994_AIF1DAC1_EQ_ENA_MASK;
-		is_eq = ON;
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_GAINS_1, val);
 
 		if (debug(DEBUG_NORMAL))
 			printk("Boeffla-sound: set_eq on\n");
 	}
+	else
+	{
+		// switch EQ off + print debug
+		val = wm8994_read(codec, WM8994_AIF1_DAC1_EQ_GAINS_1);
+		val &= ~WM8994_AIF1DAC1_EQ_ENA_MASK;
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_GAINS_1, val);
 
-	// write value back to audio hub
-	wm8994_write(codec, WM8994_AIF1_DAC1_EQ_GAINS_1, val);
+		if (debug(DEBUG_NORMAL))
+			printk("Boeffla-sound: set_eq off\n");
+	}
 
-	// in the end set saturation prevention according to configuration
+	// refresh settings for gains, bands, saturation prevention and speaker boost
+	set_eq_gains();
+	set_eq_bands();
 	set_eq_satprevention();
+	set_speaker_boost();
 }
 
+// Delayed work to apply settings after a change is detected
+
+static void apply_settings(struct work_struct *work)
+{
+	if (debug(DEBUG_NORMAL))
+		printk("Boeffla-sound: start applying settings after %d micro seconds delay\n", change_delay);
+
+	set_dac_direct();
+	set_mic_level();
+	set_mono_downmix();
+	set_speaker();
+	set_headphone();
+	set_eq();
+
+	if (debug(DEBUG_NORMAL))
+		printk("Boeffla-sound: done applying settings after %d micro seconds delay\n", change_delay);
+
+	// signal no scheduled work is pending
+	apply_settings_work_scheduled = false;
+}
 
 // Equalizer gains
 
 static void set_eq_gains(void)
 {
 	unsigned int val;
+	unsigned int gain1, gain2, gain3, gain4, gain5;
+	bool change_eq = false;
 
-	// First register
-	// read current value from audio hub and mask all bits apart from equalizer enabled bit
-	val = wm8994_read(codec, WM8994_AIF1_DAC1_EQ_GAINS_1);
-	val &= WM8994_AIF1DAC1_EQ_ENA_MASK;
+	// determine gain values based on equalizer mode (headphone vs. speaker tuning)
+	if (is_eq_headphone)
+	{
+		gain1 = eq_gains[0];
+		gain2 = eq_gains[1];
+		gain3 = eq_gains[2];
+		gain4 = eq_gains[3];
+		gain5 = eq_gains[4];
 
-	// add individual gains and write back to audio hub
-	val = val | ((eq_gains[0] + EQ_GAIN_OFFSET) << WM8994_AIF1DAC1_EQ_B1_GAIN_SHIFT);
-	val = val | ((eq_gains[1] + EQ_GAIN_OFFSET) << WM8994_AIF1DAC1_EQ_B2_GAIN_SHIFT);
-	val = val | ((eq_gains[2] + EQ_GAIN_OFFSET) << WM8994_AIF1DAC1_EQ_B3_GAIN_SHIFT);
-	wm8994_write(codec, WM8994_AIF1_DAC1_EQ_GAINS_1, val);
+		change_eq = true;
 
-	// second register
-	// set individual gains and write back to audio hub
-	val = ((eq_gains[3] + EQ_GAIN_OFFSET) << WM8994_AIF1DAC1_EQ_B4_GAIN_SHIFT);
-	val = val | ((eq_gains[4] + EQ_GAIN_OFFSET) << WM8994_AIF1DAC1_EQ_B5_GAIN_SHIFT);
-	wm8994_write(codec, WM8994_AIF1_DAC1_EQ_GAINS_2, val);
+		// print debug info
+		if (debug(DEBUG_NORMAL))
+			printk("Boeffla-sound: set_eq_gains (headphone) %d %d %d %d %d\n",
+				gain1, gain2, gain3, gain4, gain5);
+	}
+	else if (is_eq)
+	{
+		gain1 = EQ_GAIN_STUNING_1;
+		gain2 = EQ_GAIN_STUNING_2;
+		gain3 = EQ_GAIN_STUNING_3;
+		gain4 = EQ_GAIN_STUNING_4;
+		gain5 = EQ_GAIN_STUNING_5;
 
-	// print debug info
-	if (debug(DEBUG_NORMAL))
-		printk("Boeffla-sound: set_eq_gains %d %d %d %d %d\n",
-			eq_gains[0], eq_gains[1], eq_gains[2], eq_gains[3], eq_gains[4]);
+		change_eq = true;
+
+		// print debug info
+		if (debug(DEBUG_NORMAL))
+			printk("Boeffla-sound: set_eq_gains (speaker) %d %d %d %d %d\n",
+				gain1, gain2, gain3, gain4, gain5);
+	}
+
+	if (change_eq) {
+		// First register
+		// read current value from audio hub and mask all bits apart from equalizer enabled bit,
+		// add individual gains and write back to audio hub
+		val = wm8994_read(codec, WM8994_AIF1_DAC1_EQ_GAINS_1);
+		val &= WM8994_AIF1DAC1_EQ_ENA_MASK;
+		val = val | ((gain1 + EQ_GAIN_OFFSET) << WM8994_AIF1DAC1_EQ_B1_GAIN_SHIFT);
+		val = val | ((gain2 + EQ_GAIN_OFFSET) << WM8994_AIF1DAC1_EQ_B2_GAIN_SHIFT);
+		val = val | ((gain3 + EQ_GAIN_OFFSET) << WM8994_AIF1DAC1_EQ_B3_GAIN_SHIFT);
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_GAINS_1, val);
+
+		// second register
+		// set individual gains and write back to audio hub
+		val = ((gain4 + EQ_GAIN_OFFSET) << WM8994_AIF1DAC1_EQ_B4_GAIN_SHIFT);
+		val = val | ((gain5 + EQ_GAIN_OFFSET) << WM8994_AIF1DAC1_EQ_B5_GAIN_SHIFT);
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_GAINS_2, val);
+	}
 }
 
 
 // Equalizer bands
 
-static void set_eq_bands(int band)
+static void set_eq_bands()
 {
-	// depending on which band is supposed to be updated, update values and print debug info,
-	// or update all bands if requested
-	if((band == 1) || (band == BANDS_ALL))
+	// Set band frequencies either for headphone eq or for speaker tuning
+	if (is_eq_headphone)
 	{
+		// set band 1
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_1_A, eq_bands[0][0]);
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_1_B, eq_bands[0][1]);
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_1_PG, eq_bands[0][3]);
 
-		if (debug(DEBUG_NORMAL))
-			printk("Boeffla-sound: set_eq_bands 1 %d %d %d\n",
-				eq_bands[0][0], eq_bands[0][1], eq_bands[0][3]);
-	}
-
-	if((band == 2) || (band == BANDS_ALL))
-	{
+		// set band 2
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_2_A, eq_bands[1][0]);
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_2_B, eq_bands[1][1]);
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_2_C, eq_bands[1][2]);
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_2_PG, eq_bands[1][3]);
 
-		if (debug(DEBUG_NORMAL))
-			printk("Boeffla-sound: set_eq_bands 2 %d %d %d %d\n",
-				eq_bands[1][0], eq_bands[1][1], eq_bands[1][2], eq_bands[1][3]);
-	}
-
-	if((band == 3) || (band == BANDS_ALL))
-	{
+		// set band 3
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_3_A, eq_bands[2][0]);
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_3_B, eq_bands[2][1]);
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_3_C, eq_bands[2][2]);
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_3_PG, eq_bands[2][3]);
 
-		if (debug(DEBUG_NORMAL))
-			printk("Boeffla-sound: set_eq_bands 3 %d %d %d %d\n",
-				eq_bands[2][0], eq_bands[2][1], eq_bands[2][2], eq_bands[2][3]);
-	}
-
-	if((band == 4) || (band == BANDS_ALL))
-	{
+		// set band 4
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_4_A, eq_bands[3][0]);
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_4_B, eq_bands[3][1]);
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_4_C, eq_bands[3][2]);
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_4_PG, eq_bands[3][3]);
 
-		if (debug(DEBUG_NORMAL))
-			printk("Boeffla-sound: set_eq_bands 4 %d %d %d %d\n",
-				eq_bands[3][0], eq_bands[3][1], eq_bands[3][2], eq_bands[3][3]);
-	}
-
-	if((band == 5) || (band == BANDS_ALL))
-	{
+		// set band 5
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_5_A, eq_bands[4][0]);
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_5_B, eq_bands[4][1]);
 		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_5_PG, eq_bands[4][3]);
 
+		// print debug info
 		if (debug(DEBUG_NORMAL))
-			printk("Boeffla-sound: set_eq_bands 5 %d %d %d\n",
+		{
+			printk("Boeffla-sound: set_eq_bands 1 (headphone) %d %d %d\n",
+				eq_bands[0][0], eq_bands[0][1], eq_bands[0][3]);
+			printk("Boeffla-sound: set_eq_bands 2 (headphone) %d %d %d %d\n",
+				eq_bands[1][0], eq_bands[1][1], eq_bands[1][2], eq_bands[1][3]);
+			printk("Boeffla-sound: set_eq_bands 3 (headphone) %d %d %d %d\n",
+				eq_bands[2][0], eq_bands[2][1], eq_bands[2][2], eq_bands[2][3]);
+			printk("Boeffla-sound: set_eq_bands 4 (headphone) %d %d %d %d\n",
+				eq_bands[3][0], eq_bands[3][1], eq_bands[3][2], eq_bands[3][3]);
+			printk("Boeffla-sound: set_eq_bands 5 (headphone) %d %d %d\n",
 				eq_bands[4][0], eq_bands[4][1], eq_bands[4][3]);
+		}
+	}
+	else if (is_eq)
+	{
+		// set band 1
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_1_A, EQ_BAND_1_A_STUNING);
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_1_B, EQ_BAND_1_B_STUNING);
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_1_PG, EQ_BAND_1_PG_STUNING);
+
+		// set band 2
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_2_A, EQ_BAND_2_A_STUNING);
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_2_B, EQ_BAND_2_B_STUNING);
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_2_C, EQ_BAND_2_C_STUNING);
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_2_PG, EQ_BAND_2_PG_STUNING);
+
+		// set band 3
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_3_A, EQ_BAND_3_A_STUNING);
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_3_B, EQ_BAND_3_B_STUNING);
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_3_C, EQ_BAND_3_C_STUNING);
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_3_PG, EQ_BAND_3_PG_STUNING);
+
+		// set band 4
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_4_A, EQ_BAND_4_A_STUNING);
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_4_B, EQ_BAND_4_B_STUNING);
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_4_C, EQ_BAND_4_C_STUNING);
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_4_PG, EQ_BAND_4_PG_STUNING);
+
+		// set band 5
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_5_A, EQ_BAND_5_A_STUNING);
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_5_B, EQ_BAND_5_B_STUNING);
+		wm8994_write(codec, WM8994_AIF1_DAC1_EQ_BAND_5_PG, EQ_BAND_5_PG_STUNING);
+
+		// print debug info
+		if (debug(DEBUG_NORMAL))
+		{
+			printk("Boeffla-sound: set_eq_bands 1 (speaker) %d %d %d\n",
+				EQ_BAND_1_A_STUNING, EQ_BAND_1_B_STUNING, EQ_BAND_1_PG_STUNING);
+			printk("Boeffla-sound: set_eq_bands 2 (speaker) %d %d %d %d\n",
+				EQ_BAND_2_A_STUNING, EQ_BAND_2_B_STUNING, EQ_BAND_2_C_STUNING, EQ_BAND_2_PG_STUNING);
+			printk("Boeffla-sound: set_eq_bands 3 (speaker) %d %d %d %d\n",
+				EQ_BAND_3_A_STUNING, EQ_BAND_3_B_STUNING, EQ_BAND_3_C_STUNING, EQ_BAND_3_PG_STUNING);
+			printk("Boeffla-sound: set_eq_bands 4 (speaker) %d %d %d %d\n",
+				EQ_BAND_4_A_STUNING, EQ_BAND_4_B_STUNING, EQ_BAND_4_C_STUNING, EQ_BAND_4_PG_STUNING);
+			printk("Boeffla-sound: set_eq_bands 5 (speaker) %d %d %d\n",
+				EQ_BAND_5_A_STUNING, EQ_BAND_5_B_STUNING, EQ_BAND_5_PG_STUNING);
+		}
 	}
 }
 
@@ -814,113 +877,108 @@ static void set_eq_satprevention(void)
 {
 	unsigned int val;
 
-	// read current value for DRC1_3 register, modify value and write back to audio hub
-	val = wm8994_read(codec, WM8994_AIF1_DRC1_3);
-	val = get_eq_satprevention(3, val);
-	wm8994_write(codec, WM8994_AIF1_DRC1_3, val);
+	// read current value for DRC1_1 register, modify value and write back to audio hub
+	val = wm8994_read(codec, WM8994_AIF1_DRC1_1);
+	val = get_eq_satprevention(1, val);
+	wm8994_write(codec, WM8994_AIF1_DRC1_1, val);
 
 	// read current value for DRC1_2 register, modify value and write back to audio hub
 	val = wm8994_read(codec, WM8994_AIF1_DRC1_2);
 	val = get_eq_satprevention(2, val);
 	wm8994_write(codec, WM8994_AIF1_DRC1_2, val);
 
-	// read current value for DRC1_1 register, modify value and write back to audio hub
-	val = wm8994_read(codec, WM8994_AIF1_DRC1_1);
-	val = get_eq_satprevention(1, val);
-	wm8994_write(codec, WM8994_AIF1_DRC1_1, val);
+	// read current value for DRC1_3 register, modify value and write back to audio hub
+	val = wm8994_read(codec, WM8994_AIF1_DRC1_3);
+	val = get_eq_satprevention(3, val);
+	wm8994_write(codec, WM8994_AIF1_DRC1_3, val);
+
+	// read current value for DRC1_4 register, modify value and write back to audio hub
+	val = wm8994_read(codec, WM8994_AIF1_DRC1_4);
+	val = get_eq_satprevention(4, val);
+	wm8994_write(codec, WM8994_AIF1_DRC1_4, val);
 
 	// print debug information
 	if (debug(DEBUG_NORMAL))
 	{
 		// check whether saturation prevention is switched on or off based on
-		// real status of EQ and configured EQ mode
-		if (is_eq && (eq == EQ_NORMAL))
-		{
-			printk("Boeffla-sound: set_eq_satprevention to on\n");
-		}
+		// real status of EQ and configured EQ mode and speaker tuning
+		if (is_eq && is_eq_headphone && eq == EQ_NORMAL)
+			printk("Boeffla-sound: set_eq_satprevention to on (headphone)\n");
+		else if (is_eq && !is_eq_headphone && eq == EQ_NORMAL)
+			printk("Boeffla-sound: set_eq_satprevention to on (speaker)\n");
 		else
-		{
 			printk("Boeffla-sound: set_eq_satprevention to off\n");
-		}
 	}
 }
 
 
 static unsigned int get_eq_satprevention(int reg_index, unsigned int val)
 {
-	// EQ mode is with saturation prevention and EQ is in fact on
-	if ((is_eq) && (eq == EQ_NORMAL))
+	// EQ mode is for headphone with saturation prevention and EQ is in fact on
+	if (is_eq && is_eq_headphone && eq == EQ_NORMAL)
 	{
 		switch(reg_index)
 		{
-			case 1: 
-			{
+			case 1:
 				// register WM8994_AIF1_DRC1_1
-				// disable quick release and anticlip, enable drc
-				val &= ~WM8994_AIF1DRC1_QR_MASK;
-				val &= ~WM8994_AIF1DRC1_ANTICLIP_MASK;
-				val |= WM8994_AIF1DAC1_DRC_ENA;
-				return val;
-			}
+				return AIF1_DRC1_1_PREVENT;
 
 			case 2:
-			{
 				// register WM8994_AIF1_DRC1_2
-				// set new values for attack, decay and maxgain
-				val &= ~(WM8994_AIF1DRC1_ATK_MASK);
-				val &= ~(WM8994_AIF1DRC1_DCY_MASK);
-				val &= ~(WM8994_AIF1DRC1_MAXGAIN_MASK);
-				val |= (EQ_DRC_ATK_PREVENT << WM8994_AIF1DRC1_ATK_SHIFT);
-				val |= (EQ_DRC_DCY_PREVENT << WM8994_AIF1DRC1_DCY_SHIFT);
-				val |= (EQ_DRC_MAXGAIN_PREVENT << WM8994_AIF1DRC1_MAXGAIN_SHIFT);
-				return val;
-			}
+				return AIF1_DRC1_2_PREVENT;
 
 			case 3:
-			{
 				// register WM8994_AIF1_DRC1_3
-				// set new value for hi_comp above knee
-				val &= ~(WM8994_AIF1DRC1_HI_COMP_MASK);
-				val |= (EQ_DRC_HI_COMP_PREVENT << WM8994_AIF1DRC1_HI_COMP_SHIFT);
-				return val;
-			}
+				return AIF1_DRC1_3_PREVENT;
+
+			case 4:
+				// register WM8994_AIF1_DRC1_4
+				return AIF1_DRC1_4_PREVENT;
+		}
+	}
+
+	// EQ mode is for speaker tuning
+	if (is_eq && !is_eq_headphone)
+	{
+		switch(reg_index)
+		{
+			case 1:
+				// register WM8994_AIF1_DRC1_1
+				return AIF1_DRC1_1_STUNING;
+
+			case 2:
+				// register WM8994_AIF1_DRC1_2
+				return AIF1_DRC1_2_STUNING;
+
+			case 3:
+				// register WM8994_AIF1_DRC1_3
+				return AIF1_DRC1_3_STUNING;
+
+			case 4:
+				// register WM8994_AIF1_DRC1_4
+				return AIF1_DRC1_4_STUNING;
 		}
 	}
 
 	// EQ is in fact off or mode is without saturation prevention
+	// so the default values are loaded (with DRC switched off)
 	switch(reg_index)
 	{
 		case 1:
-		{
 			// register WM8994_AIF1_DRC1_1
-			// enable quick release and anticlip, disable drc
-			val |= WM8994_AIF1DRC1_QR;
-			val |= WM8994_AIF1DRC1_ANTICLIP;
-			val &= ~(WM8994_AIF1DAC1_DRC_ENA_MASK);
-			return val;
-		}
+			return AIF1_DRC1_1_DEFAULT;
 
 		case 2:
-		{
 			// register WM8994_AIF1_DRC1_2
-			// set default values for attack, decay and maxgain
-			val &= ~WM8994_AIF1DRC1_ATK_MASK;
-			val &= ~WM8994_AIF1DRC1_DCY_MASK;
-			val &= ~WM8994_AIF1DRC1_MAXGAIN_MASK;
-			val |= (EQ_DRC_ATK_DEFAULT << WM8994_AIF1DRC1_ATK_SHIFT);
-			val |= (EQ_DRC_DCY_DEFAULT << WM8994_AIF1DRC1_DCY_SHIFT);
-			val |= (EQ_DRC_MAXGAIN_DEFAULT << WM8994_AIF1DRC1_MAXGAIN_SHIFT);
-			return val;
-		}
+			return AIF1_DRC1_2_DEFAULT;
 
 		case 3:
-		{
 			// register WM8994_AIF1_DRC1_3
-			// set default value for hi_comp above knee
-			val &= ~(WM8994_AIF1DRC1_HI_COMP_MASK);
-			val |= (EQ_DRC_HI_COMP_DEFAULT << WM8994_AIF1DRC1_HI_COMP_SHIFT);
-			return val;
-		}
+			return AIF1_DRC1_3_DEFAULT;
+
+		case 4:
+			// register WM8994_AIF1_DRC1_4
+			return AIF1_DRC1_4_DEFAULT;
 	}
 
 	// We should in fact never reach this last return, only in case of errors
@@ -928,13 +986,51 @@ static unsigned int get_eq_satprevention(int reg_index, unsigned int val)
 }
 
 
+// Speaker boost (for speaker tuning)
+
+static void set_speaker_boost(void)
+{
+	unsigned int val;
+
+	// Speaker boost gets activated only if EQ mode is for speaker tuning
+	if (is_eq && !is_eq_headphone)
+	{
+		// enable speaker boost by setting the boost volume
+		val = wm8994_read(codec, WM8994_CLASSD);
+		val = (val & ~WM8994_SPKOUTL_BOOST_MASK) & ~WM8994_SPKOUTR_BOOST_MASK;
+		val = val | (SPEAKER_BOOST_TUNED << WM8994_SPKOUTL_BOOST_SHIFT);
+		val = val | (SPEAKER_BOOST_TUNED << WM8994_SPKOUTR_BOOST_SHIFT);
+		wm8994_write(codec, WM8994_CLASSD, val);
+
+		// print debug info
+		if (debug(DEBUG_NORMAL))
+			printk("Boeffla-sound: speaker boost on\n");
+	}
+	else
+	{
+		// disable speaker boost by resetting to default values
+		val = wm8994_read(codec, WM8994_CLASSD);
+		val = (val & ~WM8994_SPKOUTL_BOOST_MASK) & ~WM8994_SPKOUTR_BOOST_MASK;
+		val = val | (SPEAKER_BOOST_DEFAULT << WM8994_SPKOUTL_BOOST_SHIFT);
+		val = val | (SPEAKER_BOOST_DEFAULT << WM8994_SPKOUTR_BOOST_SHIFT);
+		wm8994_write(codec, WM8994_CLASSD, val);
+
+		// print debug info
+		if (debug(DEBUG_NORMAL))
+			printk("Boeffla-sound: speaker boost off\n");
+	}
+}
+
+
 // DAC direct
 
 static void set_dac_direct(void)
 {
+// do not touch dac direct at all if P4NOTE
+#ifndef CONFIG_MACH_P4NOTE
 	unsigned int val;
 
-	// get current values for output mixer 1 and 2 (l + r) from audio hub
+	// get current values for output mixers 1 and 2 (l + r) from audio hub
 	// modify the data accordingly and write back to audio hub
 	val = wm8994_read(codec, WM8994_OUTPUT_MIXER_1);
 	val = get_dac_direct_l(val);
@@ -944,7 +1040,7 @@ static void set_dac_direct(void)
 	val = get_dac_direct_r(val);
 	wm8994_write(codec, WM8994_OUTPUT_MIXER_2, val);
 
-	// take the value of the right channel as reference, check for the bypass bit
+	// take value of the right channel as reference, check for the bypass bit
 	// and print debug information
 	if (debug(DEBUG_NORMAL))
 	{
@@ -953,6 +1049,7 @@ static void set_dac_direct(void)
 		else
 			printk("Boeffla-sound: set_dac_direct off\n");
 	}
+#endif
 
 }
 
@@ -960,10 +1057,8 @@ static unsigned int get_dac_direct_l(unsigned int val)
 {
 	// dac direct is only enabled if fm radio is not active
 	if ((dac_direct == ON) && (!is_fmradio))
-	{
 		// enable dac_direct: bypass for both channels, mute output mixer
 		return((val & ~WM8994_DAC1L_TO_MIXOUTL) | WM8994_DAC1L_TO_HPOUT1L);
-	}
 
 	// disable dac_direct: enable bypass for both channels, mute output mixer
 	return((val & ~WM8994_DAC1L_TO_HPOUT1L) | WM8994_DAC1L_TO_MIXOUTL);
@@ -973,10 +1068,8 @@ static unsigned int get_dac_direct_r(unsigned int val)
 {
 	// dac direct is only enabled if fm radio is not active
 	if ((dac_direct == ON) && (!is_fmradio))
-	{
 		// enable dac_direct: bypass for both channels, mute output mixer
 		return((val & ~WM8994_DAC1R_TO_MIXOUTR) | WM8994_DAC1R_TO_HPOUT1R);
-	}
 
 	// disable dac_direct: enable bypass for both channels, mute output mixer
 	return((val & ~WM8994_DAC1R_TO_HPOUT1R) | WM8994_DAC1R_TO_MIXOUTR);
@@ -987,7 +1080,7 @@ static unsigned int get_dac_direct_r(unsigned int val)
 
 static void set_dac_oversampling()
 {
-	int val;
+	unsigned int val;
 
 	// read current value of oversampling register
 	val = wm8994_read(codec, WM8994_OVERSAMPLING);
@@ -1017,7 +1110,7 @@ static void set_dac_oversampling()
 
 static void set_fll_tuning(void)
 {
-	int val;
+	unsigned int val;
 
 	// read current value of FLL control register 4 and mask out loop gain value
 	val = wm8994_read(codec, WM8994_FLL1_CONTROL_4);
@@ -1045,148 +1138,145 @@ static void set_fll_tuning(void)
 }
 
 
-// MIC mode
+// Stereo expansion
 
-static void set_mic_mode(void)
+static void set_stereo_expansion(void)
 {
-	unsigned int reg_value[9];
-	int i;
+	unsigned int val;
 
-	// get current register values for selected mic mode
-	for (i=1; i<=8; i++)
+	// read current value of DAC1 filter register and mask out gain value and enable bit
+	val = wm8994_read(codec, WM8994_AIF1_DAC1_FILTERS_2);
+	val &= ~(WM8994_AIF1DAC1_3D_GAIN_MASK);
+	val &= ~(WM8994_AIF1DAC1_3D_ENA_MASK);
+
+	// depending on whether stereo expansion is 0 (=off) or not, modify values for gain
+	// and enabled bit accordingly, also print debug
+	if (stereo_expansion_gain != STEREO_EXPANSION_GAIN_OFF)
 	{
-		reg_value[i] = get_mic_mode(i);
+		val |= (stereo_expansion_gain << WM8994_AIF1DAC1_3D_GAIN_SHIFT) | WM8994_AIF1DAC1_3D_ENA;
+
+		if (debug(DEBUG_NORMAL))
+			printk("Boeffla-sound: set_stereo_expansion set to %d\n", stereo_expansion_gain);
+	}
+	else
+	{
+		if (debug(DEBUG_NORMAL))
+			printk("Boeffla-sound: set_stereo_expansion off\n");
 	}
 
-	// write values for selected mic_mode to audio hub
-	wm8994_write(codec, WM8994_LEFT_LINE_INPUT_1_2_VOLUME, reg_value[1]);
-	wm8994_write(codec, WM8994_RIGHT_LINE_INPUT_1_2_VOLUME, reg_value[2]);
-	wm8994_write(codec, WM8994_INPUT_MIXER_3, reg_value[3]);
-	wm8994_write(codec, WM8994_INPUT_MIXER_4, reg_value[4]);
-	wm8994_write(codec, WM8994_AIF1_DRC2_1, reg_value[5]);
-	wm8994_write(codec, WM8994_AIF1_DRC2_2, reg_value[6]);
-	wm8994_write(codec, WM8994_AIF1_DRC2_3, reg_value[7]);
-	wm8994_write(codec, WM8994_AIF1_DRC2_4, reg_value[8]);
+	// write value back to audio hub
+	wm8994_write(codec, WM8994_AIF1_DAC1_FILTERS_2, val);
+}
+
+
+// Mono downmix
+
+static void set_mono_downmix(void)
+{
+	unsigned int val;
+
+// P4Note has stereo speakers, so also allow mono without headphones attached
+#ifndef CONFIG_MACH_P4NOTE 
+	if (!is_call && is_headphone && (mono_downmix == ON))
+#else
+	if (!is_call  && (mono_downmix == ON))
+#endif  
+	{
+		if (!is_mono_downmix)
+		{
+			val = wm8994_read(codec, WM8994_AIF1_DAC1_FILTERS_1);
+			wm8994_write(codec, WM8994_AIF1_DAC1_FILTERS_1, val | WM8994_AIF1DAC1_MONO);
+
+			if (debug(DEBUG_NORMAL))
+				printk("Boeffla-sound: set_mono_downmix set to on\n");
+		}
+
+		is_mono_downmix = true;
+	}
+	else
+	{
+		if (is_mono_downmix)
+		{
+			val = wm8994_read(codec, WM8994_AIF1_DAC1_FILTERS_1);
+			wm8994_write(codec, WM8994_AIF1_DAC1_FILTERS_1, val & ~WM8994_AIF1DAC1_MONO);
+
+			if (debug(DEBUG_NORMAL))
+				printk("Boeffla-sound: set_mono_downmix set to off\n");
+		}
+
+		is_mono_downmix = false;
+	}
+
+}
+
+
+static unsigned int get_mono_downmix(unsigned int val)
+{
+
+	if (mono_downmix == OFF)
+		return val;
+
+	if (is_mono_downmix)
+		return val | WM8994_AIF1DAC1_MONO;
+
+	return val & ~WM8994_AIF1DAC1_MONO;
+}
+
+
+// MIC level
+
+static void set_mic_level(void)
+{
+	unsigned int val;
+
+	// if mic is not controlled by boeffla-sound, terminate and do nothing
+	if (!is_mic_controlled)
+		return;
+
+	// check if call is currently active as internal mic sensivity value
+	// is dependent on this
+	if (is_call)
+		mic_level = mic_level_call;
+	else
+		mic_level = mic_level_general;
+
+	// set input volume for both input channels
+	val = wm8994_read(codec, WM8994_LEFT_LINE_INPUT_1_2_VOLUME);
+	wm8994_write(codec, WM8994_LEFT_LINE_INPUT_1_2_VOLUME, get_mic_level(1, 0));
+
+	val = wm8994_read(codec, WM8994_RIGHT_LINE_INPUT_1_2_VOLUME);
+	wm8994_write(codec, WM8994_RIGHT_LINE_INPUT_1_2_VOLUME, get_mic_level(2, 0));
 
 	// print debug info
 	if (debug(DEBUG_NORMAL))
-		printk("Boeffla-sound: set_mic_mode %d %d %d %d %d %d %d %d\n",
-			reg_value[1], reg_value[2], reg_value[3], reg_value[4],
-			reg_value[5], reg_value[6], reg_value[7], reg_value[8]);
+		printk("Boeffla-sound: set_mic_level %d\n", mic_level);
 }
 
 
-static unsigned int get_mic_mode(int reg_index)
+static unsigned int get_mic_level(int reg_index, unsigned int val)
 {
-	// Mic mode is default or we have an active call
-	if ((mic_mode == MIC_MODE_DEFAULT) || is_call)
+
+	// check if mic is currently controlled by boeffla-sound
+	// if not, the value is returned back unchanged to not impact the microphone at all
+	if (!is_mic_controlled)
+		return val;
+
+	// send changed values back
+	switch (reg_index)
 	{
-		switch(reg_index)
-		{
-			case 1:
-				return MIC_DEFAULT_LEFT_VALUE;
-			case 2:
-				return MIC_DEFAULT_RIGHT_VALUE;
-			case 3:
-				return MIC_DEFAULT_INPUT_MIXER_3;
-			case 4:
-				return MIC_DEFAULT_INPUT_MIXER_4;
-			case 5:
-				return MIC_DEFAULT_DRC1_1;
-			case 6:
-				return MIC_DEFAULT_DRC1_2;
-			case 7:
-				return MIC_DEFAULT_DRC1_3;
-			case 8:
-				return MIC_DEFAULT_DRC1_4;
-		}
+		//  Register WM8994_LEFT_LINE_INPUT_1_2_VOLUME
+		case 1:
+			return(mic_level | WM8994_IN1_VU);
+			break;
+
+		//  Register WM8994_RIGHT_LINE_INPUT_1_2_VOLUME
+		case 2:
+			return(mic_level | WM8994_IN1_VU);
+			break;
 	}
 
-	// Mic mode is concert
-	if (mic_mode == MIC_MODE_CONCERT)
-	{
-		switch(reg_index)
-		{
-			case 1:
-				return MIC_CONCERT_LEFT_VALUE;
-			case 2:
-				return MIC_CONCERT_RIGHT_VALUE;
-			case 3:
-				return MIC_CONCERT_INPUT_MIXER_3;
-			case 4:
-				return MIC_CONCERT_INPUT_MIXER_4;
-			case 5:
-				return MIC_CONCERT_DRC1_1;
-			case 6:
-				return MIC_CONCERT_DRC1_2;
-			case 7:
-				return MIC_CONCERT_DRC1_3;
-			case 8:
-				return MIC_CONCERT_DRC1_4;
-		}
-	}
-
-	// Mic mode is concert
-	if (mic_mode == MIC_MODE_NOISY)
-	{
-		switch(reg_index)
-		{
-			case 1:
-				return MIC_NOISY_LEFT_VALUE;
-			case 2:
-				return MIC_NOISY_RIGHT_VALUE;
-			case 3:
-				return MIC_NOISY_INPUT_MIXER_3;
-			case 4:
-				return MIC_NOISY_INPUT_MIXER_4;
-			case 5:
-				return MIC_NOISY_DRC1_1;
-			case 6:
-				return MIC_NOISY_DRC1_2;
-			case 7:
-				return MIC_NOISY_DRC1_3;
-			case 8:
-				return MIC_NOISY_DRC1_4;
-		}
-	}
-
-	// Mic mode is light
-	if (mic_mode == MIC_MODE_LIGHT)
-	{
-		switch(reg_index)
-		{
-			case 1:
-				return MIC_LIGHT_LEFT_VALUE;
-			case 2:
-				return MIC_LIGHT_RIGHT_VALUE;
-			case 3:
-				return MIC_LIGHT_INPUT_MIXER_3;
-			case 4:
-				return MIC_LIGHT_INPUT_MIXER_4;
-			case 5:
-				return MIC_LIGHT_DRC1_1;
-			case 6:
-				return MIC_LIGHT_DRC1_2;
-			case 7:
-				return MIC_LIGHT_DRC1_3;
-			case 8:
-				return MIC_LIGHT_DRC1_4;
-		}
-	}
-
-	// we should never reach this, but if so in error case, return zero
-	return 0;
-}
-
-
-static unsigned int get_mic_mode_for_hook(int reg_index, unsigned int value)
-{
-	// if mic mode is default or we have an active call -> return value back to hook
-	// otherwise, request value for selected mic mode
-	if ((mic_mode == MIC_MODE_DEFAULT) || is_call)
-		return value;
-
-	return get_mic_mode(reg_index);
+	// we should never reach this point ideally, but in error case return original value
+	return val;
 }
 
 
@@ -1201,6 +1291,8 @@ static void initialize_global_variables(void)
 
 	speaker_l = SPEAKER_DEFAULT;
 	speaker_r = SPEAKER_DEFAULT;
+
+	speaker_tuning = OFF;
 
 	eq = EQ_DEFAULT;
 
@@ -1235,29 +1327,35 @@ static void initialize_global_variables(void)
 
 	fll_tuning = OFF;
 
+	stereo_expansion_gain = STEREO_EXPANSION_GAIN_OFF;
+
+	mono_downmix = OFF;
+
 	privacy_mode = OFF;
 
-	mic_mode = MIC_MODE_DEFAULT;
+	mic_level_general = MICLEVEL_GENERAL;
+	mic_level_call = MICLEVEL_CALL;
+	mic_level = MICLEVEL_GENERAL;
 
 	debug_register = 0;
 
 	is_call = false;
-	is_socket = false;
 	is_headphone = false;
 	is_fmradio = false;
+
 	is_eq = false;
+	is_eq_headphone = false;
+	is_mic_controlled=false;
+	is_mono_downmix = false;
 
 	// print debug info
 	if (debug(DEBUG_NORMAL))
 		printk("Boeffla-sound: initialize_global_variables completed\n");
-
 }
 
 
 static void reset_boeffla_sound(void)
 {
-	unsigned int val;
-
 	// print debug info
 	if (debug(DEBUG_NORMAL))
 		printk("Boeffla-sound: reset_boeffla_sound started\n");
@@ -1265,20 +1363,20 @@ static void reset_boeffla_sound(void)
 	// load all default values
 	initialize_global_variables();
 
+	// initialize headphone, call and fm radio status
+	is_call = check_for_call();
+	is_headphone = check_for_headphone();
+	is_fmradio = check_for_fmradio();
+
 	// set headphone volumes to defaults
 	set_headphone();
 
 	// set speaker volumes to defaults
 	set_speaker();
 
-	// reset equalizer mode (incl. saturation prevention)
+	// reset equalizer mode
+	// (this also resets gains, bands, saturation prevention and speaker boost)
 	set_eq();
-
-	// reset equalizer gains
-	set_eq_gains();
-
-	// reset all equalizer bands
-	set_eq_bands(BANDS_ALL);
 
 	// reset DAC_direct
 	set_dac_direct();
@@ -1289,17 +1387,18 @@ static void reset_boeffla_sound(void)
 	// reset FLL tuning
 	set_fll_tuning();
 
-	// reset mic settings
-	set_mic_mode();
+	// reset stereo expansion
+	set_stereo_expansion();
 
-	// initialize jacket status
-	val = wm8994_read(codec, WM1811_JACKDET_CTRL);
-	is_socket = check_for_socket(val);
+	// reset mono downmix
+	set_mono_downmix();
+
+	// reset mic level
+	set_mic_level();
 
 	// print debug info
 	if (debug(DEBUG_NORMAL))
 		printk("Boeffla-sound: reset_boeffla_sound completed\n");
-
 }
 
 
@@ -1313,7 +1412,7 @@ static void reset_boeffla_sound(void)
 static ssize_t boeffla_sound_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	// print current value
-	return sprintf(buf, "%d\n", boeffla_sound);
+	return sprintf(buf, "Boeffla sound status: %d\n", boeffla_sound);
 }
 
 
@@ -1336,14 +1435,6 @@ static ssize_t boeffla_sound_store(struct device *dev, struct device_attribute *
 		// Initialize Boeffla-Sound
 		boeffla_sound = val;
 		reset_boeffla_sound();
-
-		// If Boeffla-Sound was switched on, set correct status for
-		// headphone and fm_radio (assuming there is never a call when switching Sound on)
-		if (boeffla_sound == ON)
-		{
-			handler_headphone_detection();
-			is_fmradio = check_for_fmradio();
-		}
 	}
 
 	return count;
@@ -1354,10 +1445,6 @@ static ssize_t boeffla_sound_store(struct device *dev, struct device_attribute *
 
 static ssize_t headphone_volume_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return 0;
-
 	// print current values
 	return sprintf(buf, "Headphone volume:\nLeft: %d\nRight: %d\n", headphone_l, headphone_r);
 }
@@ -1379,77 +1466,20 @@ static ssize_t headphone_volume_store(struct device *dev, struct device_attribut
 
 	// check whether values are within the valid ranges and adjust accordingly
 	if (val_l > HEADPHONE_MAX)
-	{
 		val_l = HEADPHONE_MAX;
-	}
 
 	if (val_l < HEADPHONE_MIN)
-	{
 		val_l = HEADPHONE_MIN;
-	}
 
 	if (val_r > HEADPHONE_MAX)
-	{
 		val_r = HEADPHONE_MAX;
-	}
 
 	if (val_r < HEADPHONE_MIN)
-	{
 		val_r = HEADPHONE_MIN;
-	}
 
 	// store values into global variables
 	headphone_l = val_l;
 	headphone_r = val_r;
-
-	// set new values
-	set_headphone();
-
-	// print debug info
-	if (debug(DEBUG_NORMAL))
-		printk("Boeffla-sound: headphone volume L=%d R=%d\n", headphone_l, headphone_r);
-
-	return count;
-}
-
-static ssize_t headphone_volume_alt_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	// Terminate instantly if boeffla sound is not enabled
-	// As a workaround for the ST interface, display the default volume.
-	if (!boeffla_sound)
-		return sprintf(buf, "%d\n", HEADPHONE_DEFAULT);
-
-	// print current value
-	return sprintf(buf, "%d\n", headphone_l);
-}
-
-static ssize_t headphone_volume_alt_store(struct device *dev, struct device_attribute *attr,
-					const char *buf, size_t count)
-{
-	unsigned int ret = -EINVAL;
-	int val_vol;
-
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return count;
-
-	// read values from input buffer
-	ret = sscanf(buf, "%d", &val_vol);
-
-	// check whether values are within the valid ranges and adjust accordingly
-	if (val_vol > HEADPHONE_MAX)
-	{
-		val_vol = HEADPHONE_MAX;
-	}
-
-	if (val_vol < HEADPHONE_MIN)
-	{
-		val_vol = HEADPHONE_MIN;
-	}
-
-	// store values into global variables
-	headphone_l = val_vol;
-	headphone_r = val_vol;
 
 	// set new values
 	set_headphone();
@@ -1466,15 +1496,11 @@ static ssize_t headphone_volume_alt_store(struct device *dev, struct device_attr
 
 static ssize_t speaker_volume_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return 0;
-
 	// print current values
 	return sprintf(buf, "Speaker volume:\nLeft: %d\nRight: %d\n", speaker_l, speaker_r);
 
 }
+
 
 static ssize_t speaker_volume_store(struct device *dev, struct device_attribute *attr,
 					const char *buf, size_t count)
@@ -1492,24 +1518,16 @@ static ssize_t speaker_volume_store(struct device *dev, struct device_attribute 
 
 	// check whether values are within the valid ranges and adjust accordingly
 	if (val_l > SPEAKER_MAX)
-	{
 		val_l = SPEAKER_MAX;
-	}
 
 	if (val_l < SPEAKER_MIN)
-	{
 		val_l = SPEAKER_MIN;
-	}
 
 	if (val_r > SPEAKER_MAX)
-	{
 		val_r = SPEAKER_MAX;
-	}
 
 	if (val_r < SPEAKER_MIN)
-	{
 		val_r = SPEAKER_MIN;
-	}
 
 	// store values into global variables
 	speaker_l = val_l;
@@ -1525,67 +1543,45 @@ static ssize_t speaker_volume_store(struct device *dev, struct device_attribute 
 	return count;
 }
 
-static ssize_t speaker_volume_alt_show(struct device *dev, struct device_attribute *attr, char *buf)
+
+// Speaker tuning
+
+static ssize_t speaker_tuning_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-
-	// Terminate instantly if boeffla sound is not enabled
-	// As a workaround for the ST interface, display the default volume.
-	if (!boeffla_sound)
-		return sprintf(buf, "%d\n", SPEAKER_DEFAULT);
-
 	// print current value
-	return sprintf(buf, "%d\n", speaker_l);
-
+	return sprintf(buf, "Speaker tuning: %d\n", speaker_tuning);
 }
 
-static ssize_t speaker_volume_alt_store(struct device *dev, struct device_attribute *attr,
+static ssize_t speaker_tuning_store(struct device *dev, struct device_attribute *attr,
 					const char *buf, size_t count)
 {
 	unsigned int ret = -EINVAL;
-	int val_vol;
+	unsigned int val;
 
 	// Terminate instantly if boeffla sound is not enabled
 	if (!boeffla_sound)
 		return count;
 
-	// read values from input buffer
-	ret = sscanf(buf, "%d", &val_vol);
+	// read value from input buffer, check validity and update audio hub
+	ret = sscanf(buf, "%d", &val);
 
-	// check whether values are within the valid ranges and adjust accordingly
-	if (val_vol > SPEAKER_MAX)
+	if ((val == ON) || (val == OFF))
 	{
-		val_vol = SPEAKER_MAX;
+		speaker_tuning = val;
+		set_eq();
 	}
-
-	if (val_vol < SPEAKER_MIN)
-	{
-		val_vol = SPEAKER_MIN;
-	}
-
-	// store values into global variables
-	speaker_l = val_vol;
-	speaker_r = val_vol;
-
-	// set new values
-	set_speaker();
 
 	// print debug info
 	if (debug(DEBUG_NORMAL))
-		printk("Boeffla-sound: speaker volume L=%d R=%d\n", speaker_l, speaker_r);
+		printk("Boeffla-sound: DAC oversampling %d\n", dac_oversampling);
 
 	return count;
 }
-
 
 // Equalizer mode
 
 static ssize_t eq_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return 0;
-
 	// print current value
 	return sprintf(buf, "EQ: %d\n", eq);
 }
@@ -1605,10 +1601,8 @@ static ssize_t eq_store(struct device *dev, struct device_attribute *attr,
 	ret = sscanf(buf, "%d", &val);
 
 	if (((val >= EQ_OFF) && (val <= EQ_NOSATPREVENT)) && (val != eq))
-	{
 		eq = val;
-		set_eq();
-	}
+	set_eq();
 
 	// print debug info
 	if (debug(DEBUG_NORMAL))
@@ -1622,10 +1616,6 @@ static ssize_t eq_store(struct device *dev, struct device_attribute *attr,
 
 static ssize_t eq_gains_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return 0;
-
 	// print current values
 	return sprintf(buf, "EQ gains: %d %d %d %d %d\n",
 			eq_gains[0], eq_gains[1], eq_gains[2], eq_gains[3], eq_gains[4]);
@@ -1670,131 +1660,13 @@ static ssize_t eq_gains_store(struct device *dev, struct device_attribute *attr,
 }
 
 
-// Equalizer gains (alternative interface to allow per band setting for script manager)
-
-static ssize_t eq_gains_alt_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return 0;
-
-	// print current values
-	return sprintf(buf, "EQ gains (band/level):\n1: %d\n2: %d\n3: %d\n4: %d\n5: %d\n",
-			eq_gains[0], eq_gains[1], eq_gains[2], eq_gains[3], eq_gains[4]);
-}
-
-
-static ssize_t eq_gains_alt_store(struct device *dev, struct device_attribute *attr,
-					const char *buf, size_t count)
-{
-	unsigned int ret = -EINVAL;
-	int band;
-	int gain;
-
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return count;
-
-	// read values from input buffer
-	ret = sscanf(buf, "%d %d", &band, &gain);
-
-	// check validity of band value
-	if ((band >= 1) && (band <= 5))
-	{
-
-		// check validity of gain value and adjust
-		if (gain < EQ_GAIN_MIN)
-			gain = EQ_GAIN_MIN;
-
-		if (gain > EQ_GAIN_MAX)
-			gain = EQ_GAIN_MAX;
-
-		eq_gains[band-1] = gain;
-
-		// set new value(s)
-		set_eq_gains();
-
-		// print debug info
-		if (debug(DEBUG_NORMAL))
-			printk("Boeffla-sound: EQ gain set for band %d: %d\n",
-				band, gain);
-	}
-	else
-	{
-		// print debug info
-		if (debug(DEBUG_NORMAL))
-			printk("Boeffla-sound: Invalid band specified");
-
-	}
-
-	return count;
-}
-
-
-// Individual band gain interface
-
-static ssize_t eq_gain_band1_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return 0;
-
-	// Print current value for band.
-	return sprintf(buf, "%d\n", eq_gains[0]);
-}
-
-static ssize_t eq_gain_band2_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return 0;
-
-	// Print current value for band.
-	return sprintf(buf, "%d\n", eq_gains[1]);
-}
-
-static ssize_t eq_gain_band3_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return 0;
-
-	// Print current value for band.
-	return sprintf(buf, "%d\n", eq_gains[2]);
-}
-
-static ssize_t eq_gain_band4_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return 0;
-
-	// Print current values for band.
-	return sprintf(buf, "%d\n", eq_gains[3]);
-}
-
-static ssize_t eq_gain_band5_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return 0;
-
-	// Print current values for band.
-	return sprintf(buf, "%d\n", eq_gains[4]);
-}
-
-
 // Equalizer bands
 
 static ssize_t eq_bands_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return 0;
-
 	// print current values
-	return sprintf(buf, 
-		"band a b c pg\n1: %d %d %d %d\n2: %d %d %d %d\n3: %d %d %d %d\n4: %d %d %d %d\n5: %d %d %d %d\n", 
+	return sprintf(buf,
+		"band a b c pg\n1: %d %d %d %d\n2: %d %d %d %d\n3: %d %d %d %d\n4: %d %d %d %d\n5: %d %d %d %d\n",
 			eq_bands[0][0], eq_bands[0][1], 0, eq_bands[0][3],
 			eq_bands[1][0], eq_bands[1][1], eq_bands[1][2], eq_bands[1][3],
 			eq_bands[2][0], eq_bands[2][1], eq_bands[2][2], eq_bands[2][3],
@@ -1826,7 +1698,7 @@ static ssize_t eq_bands_store(struct device *dev, struct device_attribute *attr,
 	eq_bands[band-1][3] = v4;
 
 	// set new values
-	set_eq_bands(band);
+	set_eq_bands();
 
 	// print debug info
 	if (debug(DEBUG_NORMAL))
@@ -1841,11 +1713,13 @@ static ssize_t eq_bands_store(struct device *dev, struct device_attribute *attr,
 
 static ssize_t dac_direct_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return sprintf(buf, "0\n");
-
-	return sprintf(buf, "%d\n", dac_direct);
+// For P4NOTE, dac direct always needs to be enabled, so the setting is
+// returned as blank = setting not active
+#ifndef CONFIG_MACH_P4NOTE
+	return sprintf(buf, "DAC direct: %d\n", dac_direct);
+#else
+	return 0;
+#endif
 }
 
 
@@ -1880,11 +1754,7 @@ static ssize_t dac_direct_store(struct device *dev, struct device_attribute *att
 
 static ssize_t dac_oversampling_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return sprintf(buf, "0\n");
-
-	return sprintf(buf, "%d\n", dac_oversampling);
+	return sprintf(buf, "DAC oversampling: %d\n", dac_oversampling);
 }
 
 
@@ -1919,11 +1789,7 @@ static ssize_t dac_oversampling_store(struct device *dev, struct device_attribut
 
 static ssize_t fll_tuning_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return sprintf(buf, "0\n");
-
-	return sprintf(buf, "%d\n", fll_tuning);
+	return sprintf(buf, "FLL tuning: %d\n", fll_tuning);
 }
 
 
@@ -1954,15 +1820,82 @@ static ssize_t fll_tuning_store(struct device *dev, struct device_attribute *att
 }
 
 
+// Stereo expansion
+
+static ssize_t stereo_expansion_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "Stereo expansion: %d\n", stereo_expansion_gain);
+}
+
+
+static ssize_t stereo_expansion_store(struct device *dev, struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	unsigned int ret = -EINVAL;
+	unsigned int val;
+
+	// Terminate instantly if boeffla sound is not enabled
+	if (!boeffla_sound)
+		return count;
+
+	// read values from input buffer, check validity and update audio hub
+	ret = sscanf(buf, "%d", &val);
+
+	if ((val >= STEREO_EXPANSION_GAIN_MIN) && (val <= STEREO_EXPANSION_GAIN_MAX))
+	{
+		stereo_expansion_gain = val;
+		set_stereo_expansion();
+	}
+
+	// print debug info
+	if (debug(DEBUG_NORMAL))
+		printk("Boeffla-sound: Stereo expansion %d\n", stereo_expansion_gain);
+
+	return count;
+}
+
+
+// Mono downmix
+
+static ssize_t mono_downmix_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "Mono downmix: %d\n", mono_downmix);
+}
+
+
+static ssize_t mono_downmix_store(struct device *dev, struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	unsigned int ret = -EINVAL;
+	unsigned int val;
+
+	// Terminate instantly if boeffla sound is not enabled
+	if (!boeffla_sound)
+		return count;
+
+	// read values from input buffer
+	ret = sscanf(buf, "%d", &val);
+
+	// update only if new value is valid and has changed
+	if (((val == ON) || (val == OFF)) && (val != mono_downmix))
+	{
+		mono_downmix = val;
+		set_mono_downmix();
+
+		// print debug info
+		if (debug(DEBUG_NORMAL))
+			printk("Boeffla-sound: Mono downmix %d\n", mono_downmix);
+	}
+
+	return count;
+}
+
+
 // Privacy mode
 
 static ssize_t privacy_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return sprintf(buf, "0\n");
-
-	return sprintf(buf, "%d\n", privacy_mode);
+	return sprintf(buf, "Privacy mode: %d\n", privacy_mode);
 }
 
 
@@ -1993,20 +1926,15 @@ static ssize_t privacy_mode_store(struct device *dev, struct device_attribute *a
 }
 
 
-// Microphone mode
+// Microphone levels
 
-static ssize_t mic_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t mic_level_general_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-
-	// Terminate instantly if boeffla sound is not enabled
-	if (!boeffla_sound)
-		return sprintf(buf, "0\n");
-
-	return sprintf(buf, "%d\n", mic_mode);
+	return sprintf(buf, "Mic level general %d\n", mic_level_general);
 }
 
 
-static ssize_t mic_mode_store(struct device *dev, struct device_attribute *attr,
+static ssize_t mic_level_general_store(struct device *dev, struct device_attribute *attr,
 					const char *buf, size_t count)
 {
 	unsigned int ret = -EINVAL;
@@ -2016,19 +1944,80 @@ static ssize_t mic_mode_store(struct device *dev, struct device_attribute *attr,
 	if (!boeffla_sound)
 		return count;
 
-	// read value for mic_mode from input buffer
+	// read value for mic level from input buffer
 	ret = sscanf(buf, "%d", &val);
 
-	// check validity of data and update audio hub
-	if ((val >= MIC_MODE_DEFAULT) && (val <= MIC_MODE_LIGHT))
+	// check validity of data
+	if ((val >= MICLEVEL_MIN) && (val <= MICLEVEL_MAX))
 	{
-		mic_mode = val;
-		set_mic_mode();
+		// only do something if the value has changed
+		if (mic_level_general != val)
+		{
+			mic_level_general = val;
+
+			// from now on, boeffla-sound controls the microphone exclusively
+			is_mic_controlled = true;
+
+			// set mic level now
+			set_mic_level();
+
+			// print debug info
+			if (debug(DEBUG_NORMAL))
+				printk("Boeffla-sound: Mic level general %d\n", mic_level_general);
+		}
 	}
 
-	// print debug info
-	if (debug(DEBUG_NORMAL))
-		printk("Boeffla-sound: Mic mode %d\n", mic_mode);
+	// Just in case the mic levels for both general and call have been reset
+	// to defaults, Boeffla-Sound releases control over the microphone again
+	if ((mic_level_general == MICLEVEL_GENERAL) && (mic_level_call == MICLEVEL_CALL))
+		is_mic_controlled = false;
+
+	return count;
+}
+
+static ssize_t mic_level_call_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "Mic level call %d\n", mic_level_call);
+}
+
+
+static ssize_t mic_level_call_store(struct device *dev, struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	unsigned int ret = -EINVAL;
+	unsigned int val;
+
+	// Terminate instantly if boeffla sound is not enabled
+	if (!boeffla_sound)
+		return count;
+
+	// read value for mic level from input buffer
+	ret = sscanf(buf, "%d", &val);
+
+	// check validity of data
+	if ((val >= MICLEVEL_MIN) && (val <= MICLEVEL_MAX))
+	{
+		// only do something if the value has changed
+		if (mic_level_call != val)
+		{
+			mic_level_call = val;
+
+			// from now on, boeffla-sound controls the microphone exclusively
+			is_mic_controlled = true;
+
+			// set mic level now
+			set_mic_level();
+
+			// print debug info
+			if (debug(DEBUG_NORMAL))
+				printk("Boeffla-sound: Mic level call %d\n", mic_level_call);
+		}
+	}
+
+	// Just in case the mic levels for both general and call have been reset
+	// to defaults, Boeffla-Sound releases control over the microphone again
+	if ((mic_level_general == MICLEVEL_GENERAL) && (mic_level_call == MICLEVEL_CALL))
+		is_mic_controlled = false;
 
 	return count;
 }
@@ -2038,8 +2027,8 @@ static ssize_t mic_mode_store(struct device *dev, struct device_attribute *attr,
 
 static ssize_t debug_level_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	// return current debug level back
-	// (this also works when boeffla-sound is disabled)
+	// return current debug level
+	// (this exceptionally also works when boeffla-sound is disabled)
 	return sprintf(buf, "Debug level: %d\n", debug_level);
 }
 
@@ -2054,9 +2043,7 @@ static ssize_t debug_level_store(struct device *dev, struct device_attribute *at
 	ret = sscanf(buf, "%d", &val);
 
 	if ((val >= 0) && (val <= 2))
-	{
 		debug_level = val;
-	}
 
 	return count;
 }
@@ -2087,6 +2074,9 @@ static ssize_t debug_info_show(struct device *dev, struct device_attribute *attr
 	val = wm8994_read(codec, WM8994_SPEAKER_VOLUME_RIGHT);
 	sprintf(buf+strlen(buf), "WM8994_SPEAKER_VOLUME_RIGHT: %d\n", val);
 
+	val = wm8994_read(codec, WM8994_CLASSD);
+	sprintf(buf+strlen(buf), "WM8994_CLASSD: %d\n", val);
+
 	val = wm8994_read(codec, WM8994_AIF1_DAC1_EQ_GAINS_1);
 	sprintf(buf+strlen(buf), "WM8994_AIF1_DAC1_EQ_GAINS_1: %d\n", val);
 
@@ -2101,6 +2091,9 @@ static ssize_t debug_info_show(struct device *dev, struct device_attribute *attr
 
 	val = wm8994_read(codec, WM8994_AIF1_DRC1_3);
 	sprintf(buf+strlen(buf), "WM8994_AIF1_DRC1_3: %d\n", val);
+
+	val = wm8994_read(codec, WM8994_AIF1_DRC1_4);
+	sprintf(buf+strlen(buf), "WM8994_AIF1_DRC1_4: %d\n", val);
 
 	val = wm8994_read(codec, WM8994_OUTPUT_MIXER_1);
 	sprintf(buf+strlen(buf), "WM8994_OUTPUT_MIXER_1: %d\n", val);
@@ -2126,21 +2119,23 @@ static ssize_t debug_info_show(struct device *dev, struct device_attribute *attr
 	val = wm8994_read(codec, WM8994_INPUT_MIXER_4);
 	sprintf(buf+strlen(buf), "WM8994_INPUT_MIXER_4: %d\n", val);
 
-	val = wm8994_read(codec, WM8994_AIF1_DRC2_1);
-	sprintf(buf+strlen(buf), "WM8994_AIF1_DRC2_1: %d\n", val);
+	val = wm8994_read(codec, WM8994_AIF1_DAC1_FILTERS_1);
+	sprintf(buf+strlen(buf), "WM8994_AIF1_DAC1_FILTERS_1: %d\n", val);
 
-	val = wm8994_read(codec, WM8994_AIF1_DRC2_2);
-	sprintf(buf+strlen(buf), "WM8994_AIF1_DRC2_2: %d\n", val);
+	val = wm8994_read(codec, WM8994_AIF1_DAC1_FILTERS_2);
+	sprintf(buf+strlen(buf), "WM8994_AIF1_DAC1_FILTERS_2: %d\n", val);
 
-	val = wm8994_read(codec, WM8994_AIF1_DRC2_3);
-	sprintf(buf+strlen(buf), "WM8994_AIF1_DRC2_3: %d\n", val);
+	// add the current states of call, headphone and fmradio
+	sprintf(buf+strlen(buf), "is_call:%d is_headphone:%d is_fmradio:%d\n",
+				is_call, is_headphone, is_fmradio);
 
-	val = wm8994_read(codec, WM8994_AIF1_DRC2_4);
-	sprintf(buf+strlen(buf), "WM8994_AIF1_DRC2_4: %d\n\n", val);
+	// add the current states of internal headphone handling and mono downmix
+	sprintf(buf+strlen(buf), "is_eq:%d is_eq_headphone: %d is_mono_downmix: %d\n",
+				is_eq, is_eq_headphone, is_mono_downmix);
 
-	// finally add the current states of call, headphone and fmradio
-	sprintf(buf+strlen(buf), "is_call:%d is_socket: %d is_headphone:%d is_fmradio:%d is_eq:%d\n", 
-				is_call, is_socket, is_headphone, is_fmradio, is_eq);
+	// finally add the current states of internal mic level, gain and control state
+	sprintf(buf+strlen(buf), "mic_level: %d is_mic_controlled: %d\n",
+				mic_level, is_mic_controlled);
 
 	// return buffer length back
 	return strlen(buf);
@@ -2151,7 +2146,6 @@ static ssize_t debug_info_store(struct device *dev, struct device_attribute *att
 					const char *buf, size_t count)
 {
 	// this function has no function, but can be misused for some debugging/testing
-
 	return count;
 }
 
@@ -2179,11 +2173,85 @@ static ssize_t debug_reg_store(struct device *dev, struct device_attribute *attr
 	ret = sscanf(buf, "%d %d %d", &debug_register, &val1, &val2);
 
 	if (val1 == DEBUG_REGISTER_KEY)
-	{
 		wm8994_write(codec, debug_register, val2);
-	}
 
 	return count;
+}
+
+
+// Debug dump
+
+static ssize_t debug_dump_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	unsigned int val;
+	int i;
+
+	// read selected bank, compare with cache and print results
+	for (i = regdump_bank*REGDUMP_REGISTERS; i <= (regdump_bank+1)*REGDUMP_REGISTERS; i++)
+	{
+		val = wm8994_read(codec, i);
+
+		if(regcache[i] != val)
+			sprintf(buf+strlen(buf), "%d: %d -> %d\n", i, regcache[i], val);
+		else
+			sprintf(buf+strlen(buf), "%d: %d\n", i, val);
+
+		regcache[i] = val;
+	}
+
+	// return buffer length back
+	return strlen(buf);
+}
+
+
+static ssize_t debug_dump_store(struct device *dev, struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	unsigned int ret = -EINVAL;
+	unsigned int val;
+
+	// read value from input buffer and set bank accordingly
+	ret = sscanf(buf, "%d", &val);
+
+	if ((val >= 0) && (val < REGDUMP_BANKS))
+		regdump_bank = val;
+
+	return count;
+}
+
+
+// Change delay
+
+static ssize_t change_delay_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	// print current value
+	return sprintf(buf, "Boeffla change delay: %d\n", change_delay);
+}
+
+
+static ssize_t change_delay_store(struct device *dev, struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	unsigned int ret = -EINVAL;
+	int val;
+
+	// read values from input buffer
+	ret = sscanf(buf, "%d", &val);
+
+	// store if valid data and only if status has changed, reset all values
+	if ((val >= MIN_CHANGE_DELAY) && (val <= MAX_CHANGE_DELAY))
+	{
+		// print debug info
+		if (debug(DEBUG_NORMAL))
+			printk("Boeffla-sound: change delay %d micro seconds\n", change_delay);
+
+		// Store new change delay
+		change_delay = val;
+
+		return count;
+	}
+
+	return -EINVAL;
 }
 
 
@@ -2204,52 +2272,48 @@ static ssize_t version_show(struct device *dev, struct device_attribute *attr, c
 // define objects
 static DEVICE_ATTR(boeffla_sound, S_IRUGO | S_IWUGO, boeffla_sound_show, boeffla_sound_store);
 static DEVICE_ATTR(headphone_volume, S_IRUGO | S_IWUGO, headphone_volume_show, headphone_volume_store);
-static DEVICE_ATTR(headphone_volume_alt, S_IRUGO | S_IWUGO, headphone_volume_alt_show, headphone_volume_alt_store);
 static DEVICE_ATTR(speaker_volume, S_IRUGO | S_IWUGO, speaker_volume_show, speaker_volume_store);
-static DEVICE_ATTR(speaker_volume_alt, S_IRUGO | S_IWUGO, speaker_volume_alt_show, speaker_volume_alt_store);
+static DEVICE_ATTR(speaker_tuning, S_IRUGO | S_IWUGO, speaker_tuning_show, speaker_tuning_store);
 static DEVICE_ATTR(privacy_mode, S_IRUGO | S_IWUGO, privacy_mode_show, privacy_mode_store);
 static DEVICE_ATTR(eq, S_IRUGO | S_IWUGO, eq_show, eq_store);
 static DEVICE_ATTR(eq_gains, S_IRUGO | S_IWUGO, eq_gains_show, eq_gains_store);
-static DEVICE_ATTR(eq_gains_alt, S_IRUGO | S_IWUGO, eq_gains_alt_show, eq_gains_alt_store);
-static DEVICE_ATTR(eq_gain_band1, S_IRUGO | S_IWUGO, eq_gain_band1_show, eq_gains_alt_store);
-static DEVICE_ATTR(eq_gain_band2, S_IRUGO | S_IWUGO, eq_gain_band2_show, eq_gains_alt_store);
-static DEVICE_ATTR(eq_gain_band3, S_IRUGO | S_IWUGO, eq_gain_band3_show, eq_gains_alt_store);
-static DEVICE_ATTR(eq_gain_band4, S_IRUGO | S_IWUGO, eq_gain_band4_show, eq_gains_alt_store);
-static DEVICE_ATTR(eq_gain_band5, S_IRUGO | S_IWUGO, eq_gain_band5_show, eq_gains_alt_store);
 static DEVICE_ATTR(eq_bands, S_IRUGO | S_IWUGO, eq_bands_show, eq_bands_store);
 static DEVICE_ATTR(dac_direct, S_IRUGO | S_IWUGO, dac_direct_show, dac_direct_store);
 static DEVICE_ATTR(dac_oversampling, S_IRUGO | S_IWUGO, dac_oversampling_show, dac_oversampling_store);
 static DEVICE_ATTR(fll_tuning, S_IRUGO | S_IWUGO, fll_tuning_show, fll_tuning_store);
-static DEVICE_ATTR(mic_mode, S_IRUGO | S_IWUGO, mic_mode_show, mic_mode_store);
+static DEVICE_ATTR(stereo_expansion, S_IRUGO | S_IWUGO, stereo_expansion_show, stereo_expansion_store);
+static DEVICE_ATTR(mono_downmix, S_IRUGO | S_IWUGO, mono_downmix_show, mono_downmix_store);
+static DEVICE_ATTR(mic_level_general, S_IRUGO | S_IWUGO, mic_level_general_show, mic_level_general_store);
+static DEVICE_ATTR(mic_level_call, S_IRUGO | S_IWUGO, mic_level_call_show, mic_level_call_store);
 static DEVICE_ATTR(debug_level, S_IRUGO | S_IWUGO, debug_level_show, debug_level_store);
 static DEVICE_ATTR(debug_info, S_IRUGO | S_IWUGO, debug_info_show, debug_info_store);
 static DEVICE_ATTR(debug_reg, S_IRUGO | S_IWUGO, debug_reg_show, debug_reg_store);
+static DEVICE_ATTR(debug_dump, S_IRUGO | S_IWUGO, debug_dump_show, debug_dump_store);
+static DEVICE_ATTR(change_delay, S_IRUGO | S_IWUGO, change_delay_show, change_delay_store);
 static DEVICE_ATTR(version, S_IRUGO | S_IWUGO, version_show, NULL);
 
 // define attributes
 static struct attribute *boeffla_sound_attributes[] = {
 	&dev_attr_boeffla_sound.attr,
 	&dev_attr_headphone_volume.attr,
-	&dev_attr_headphone_volume_alt.attr,
 	&dev_attr_speaker_volume.attr,
-	&dev_attr_speaker_volume_alt.attr,
+	&dev_attr_speaker_tuning.attr,
 	&dev_attr_privacy_mode.attr,
 	&dev_attr_eq.attr,
 	&dev_attr_eq_gains.attr,
-	&dev_attr_eq_gains_alt.attr,
-	&dev_attr_eq_gain_band1.attr,
-	&dev_attr_eq_gain_band2.attr,
-	&dev_attr_eq_gain_band3.attr,
-	&dev_attr_eq_gain_band4.attr,
-	&dev_attr_eq_gain_band5.attr,
 	&dev_attr_eq_bands.attr,
 	&dev_attr_dac_direct.attr,
 	&dev_attr_dac_oversampling.attr,
 	&dev_attr_fll_tuning.attr,
-	&dev_attr_mic_mode.attr,
+	&dev_attr_stereo_expansion.attr,
+	&dev_attr_mono_downmix.attr,
+	&dev_attr_mic_level_general.attr,
+	&dev_attr_mic_level_call.attr,
 	&dev_attr_debug_level.attr,
 	&dev_attr_debug_info.attr,
 	&dev_attr_debug_reg.attr,
+	&dev_attr_debug_dump.attr,
+	&dev_attr_change_delay.attr,
 	&dev_attr_version.attr,
 	NULL
 };
@@ -2280,15 +2344,22 @@ static int boeffla_sound_init(void)
 		return 0;
 	}
 
+	// Initialize boeffla sound master switch with OFF per default (will be set to correct
+	// default value when we receive the codec pointer later - avoids startup boot loop)
+	boeffla_sound = OFF;
+
+	// initialize global variables and default debug level
+	initialize_global_variables();
+
+	// One-time only initialisations
+	debug_level = DEBUG_DEFAULT;
+	regdump_bank = 0;
+
+	// Initialize delayed work for Eq reapplication
+	INIT_DELAYED_WORK_DEFERRABLE(&apply_settings_work, apply_settings);
+
 	// Print debug info
 	printk("Boeffla-sound: engine version %s started\n", BOEFFLA_SOUND_VERSION);
-
-	// Initialize boeffla sound master switch and default debug level
-	boeffla_sound = BOEFFLA_SOUND_DEFAULT;
-	debug_level = DEBUG_DEFAULT;
-
-	// initialize global variables
-	initialize_global_variables();
 
 	return 0;
 }
