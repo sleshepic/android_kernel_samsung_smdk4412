@@ -24,6 +24,11 @@
 
 #define CPUFREQ_NAME_LEN 16
 
+extern unsigned int flg_ctr_typingbooster_cycles;
+extern unsigned int sttg_typingbooster_mincores;
+extern unsigned int sttg_typingbooster_upthreshold;
+void zzmoove_touchbooster_mincores(unsigned int cores);
+extern unsigned int flg_ctr_incoming_call;
 
 /*********************************************************************
  *                     CPUFREQ NOTIFIER INTERFACE                    *
